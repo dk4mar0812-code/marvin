@@ -4,3 +4,4 @@ numpy==1.26.4
 python-multipart==0.0.12
 edge-impulse-linux
 pyaudio
+six
