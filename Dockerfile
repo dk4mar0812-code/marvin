@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libstdc++6 \
     libc6 \
-    libatlas-base-dev \
+    libatlas3-base \
     libopenblas-dev \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
