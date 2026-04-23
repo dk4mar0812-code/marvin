@@ -5,6 +5,7 @@ Marvin Voice Command Backend (SDK version)
 import os
 import tempfile
 import wave
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -37,20 +38,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── MODEL (loaded at startup) ───────────────────
+# ─── MODEL (background loading) ──────────────────
 
 runner = None
 
 @app.on_event("startup")
 async def load_model():
     global runner
+
     print("📂 Files in /app:", os.listdir(BASE_DIR))
     print("📌 Using model path:", MODEL_PATH)
 
-    print("[EIM] Loading model...")
-    runner = ImpulseRunner(str(MODEL_PATH))
-    model_info = runner.init()
-    print("[EIM] Model loaded:", model_info)
+    async def init_model():
+        global runner
+        try:
+            print("[EIM] Loading model...")
+            runner = ImpulseRunner(str(MODEL_PATH))
+            model_info = runner.init()
+            print("[EIM] Model loaded:", model_info)
+        except Exception as e:
+            print("❌ Model failed to load:", e)
+
+    # run without blocking server startup
+    asyncio.create_task(init_model())
 
 # ─── HELPERS ─────────────────────────────────────
 
@@ -119,11 +129,17 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": runner is not None}
+    return {
+        "status": "ok",
+        "model_loaded": runner is not None
+    }
 
 
 @app.post("/classify/raw")
 async def classify_raw(file: UploadFile = File(...)):
+    if runner is None:
+        raise HTTPException(503, "Model still loading")
+
     contents = await file.read()
 
     if len(contents) < 100:
@@ -138,6 +154,9 @@ async def classify_raw(file: UploadFile = File(...)):
 
 @app.post("/classify/wav")
 async def classify_wav(file: UploadFile = File(...)):
+    if runner is None:
+        raise HTTPException(503, "Model still loading")
+
     contents = await file.read()
 
     if len(contents) < 44:
