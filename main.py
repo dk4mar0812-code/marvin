@@ -28,10 +28,18 @@ print("📂 Files in /app:", os.listdir(BASE_DIR))
 print("📌 Using model path:", MODEL_PATH)
 
 # ─── MODEL LOAD ──────────────────────────────────
-print("[EIM] Loading model...")
-runner = ImpulseRunner(str(MODEL_PATH))
-model_info = runner.init()
-print("[EIM] Model loaded:", model_info)
+runner = None  # global reference
+
+@app.on_event("startup")
+async def load_model():
+    global runner
+    print("📂 Files in /app:", os.listdir(BASE_DIR))
+    print("📌 Using model path:", MODEL_PATH)
+
+    print("[EIM] Loading model...")
+    runner = ImpulseRunner(str(MODEL_PATH))
+    model_info = runner.init()
+    print("[EIM] Model loaded:", model_info)
 
 # ─── APP ─────────────────────────────────────────
 app = FastAPI(
