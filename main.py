@@ -16,32 +16,15 @@ from edge_impulse_linux.runner import ImpulseRunner
 # ─── CONFIG ──────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "model.eim"   # ✅ absolute path fix
+MODEL_PATH = BASE_DIR / "model.eim"
 
 SAMPLE_RATE = 16000
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6"))
 
 LABELS = ["Clock", "Forecast", "Greet", "Hello", "Noise", "Off", "Stop", "Unknown", "Weather"]
 
-# 🔍 DEBUG (very useful for deployment)
-print("📂 Files in /app:", os.listdir(BASE_DIR))
-print("📌 Using model path:", MODEL_PATH)
-
-# ─── MODEL LOAD ──────────────────────────────────
-runner = None  # global reference
-
-@app.on_event("startup")
-async def load_model():
-    global runner
-    print("📂 Files in /app:", os.listdir(BASE_DIR))
-    print("📌 Using model path:", MODEL_PATH)
-
-    print("[EIM] Loading model...")
-    runner = ImpulseRunner(str(MODEL_PATH))
-    model_info = runner.init()
-    print("[EIM] Model loaded:", model_info)
-
 # ─── APP ─────────────────────────────────────────
+
 app = FastAPI(
     title="Marvin Voice Command API",
     version="2.0.0",
@@ -53,6 +36,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── MODEL (loaded at startup) ───────────────────
+
+runner = None
+
+@app.on_event("startup")
+async def load_model():
+    global runner
+    print("📂 Files in /app:", os.listdir(BASE_DIR))
+    print("📌 Using model path:", MODEL_PATH)
+
+    print("[EIM] Loading model...")
+    runner = ImpulseRunner(str(MODEL_PATH))
+    model_info = runner.init()
+    print("[EIM] Model loaded:", model_info)
 
 # ─── HELPERS ─────────────────────────────────────
 
@@ -121,7 +119,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": True}
+    return {"status": "ok", "model_loaded": runner is not None}
 
 
 @app.post("/classify/raw")
@@ -134,11 +132,7 @@ async def classify_raw(file: UploadFile = File(...)):
     samples = raw_pcm_to_samples(contents)
     duration = len(samples) / SAMPLE_RATE
 
-    try:
-        result = runner.classify(samples.tolist())
-    except Exception as e:
-        raise HTTPException(500, f"Inference failed: {e}")
-
+    result = runner.classify(samples.tolist())
     return JSONResponse(build_response(result, duration))
 
 
@@ -152,9 +146,5 @@ async def classify_wav(file: UploadFile = File(...)):
     samples = wav_bytes_to_samples(contents)
     duration = len(samples) / SAMPLE_RATE
 
-    try:
-        result = runner.classify(samples.tolist())
-    except Exception as e:
-        raise HTTPException(500, f"Inference failed: {e}")
-
+    result = runner.classify(samples.tolist())
     return JSONResponse(build_response(result, duration))
