@@ -5,3 +5,4 @@ python-multipart==0.0.12
 edge-impulse-linux
 pyaudio
 six
+opencv-python-headless
