@@ -14,11 +14,18 @@ from fastapi.responses import JSONResponse
 from edge_impulse_linux.runner import ImpulseRunner
 
 # ─── CONFIG ──────────────────────────────────────
-MODEL_PATH = Path(os.environ.get("MODEL_PATH", "model.eim"))
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "model.eim"   # ✅ absolute path fix
+
 SAMPLE_RATE = 16000
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6"))
 
 LABELS = ["Clock", "Forecast", "Greet", "Hello", "Noise", "Off", "Stop", "Unknown", "Weather"]
+
+# 🔍 DEBUG (very useful for deployment)
+print("📂 Files in /app:", os.listdir(BASE_DIR))
+print("📌 Using model path:", MODEL_PATH)
 
 # ─── MODEL LOAD ──────────────────────────────────
 print("[EIM] Loading model...")
@@ -40,6 +47,7 @@ app.add_middleware(
 )
 
 # ─── HELPERS ─────────────────────────────────────
+
 def wav_bytes_to_samples(wav_bytes: bytes) -> np.ndarray:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(wav_bytes)
@@ -93,6 +101,7 @@ def build_response(eim_result: dict, audio_duration_s: float) -> dict:
     }
 
 # ─── ROUTES ──────────────────────────────────────
+
 @app.get("/")
 def root():
     return {
