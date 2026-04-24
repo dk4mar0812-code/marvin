@@ -60,17 +60,22 @@ class EIMRunner:
         print(f"[EIM] Starting: {self.model_path}")
         self.process = subprocess.Popen(
             [str(self.model_path), self.socket_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # capture output so errors appear in Render logs
         )
  
         # Wait up to 15 s for the socket to appear
         for _ in range(150):
             if os.path.exists(self.socket_path):
                 break
+            # If process died, read its output and raise with details
+            if self.process.poll() is not None:
+                out = self.process.stdout.read().decode(errors="replace")
+                raise RuntimeError(f"EIM model exited early.\nOutput:\n{out}")
             time.sleep(0.1)
         else:
-            raise RuntimeError("EIM model did not create socket in time")
+            out = self.process.stdout.read().decode(errors="replace") if self.process.poll() is not None else "(still running - likely missing shared memory or library)"
+            raise RuntimeError(f"EIM model did not create socket in time.\nOutput:\n{out}")
  
         print("[EIM] Ready ✓")
         self.ready = True
