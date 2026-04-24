@@ -1,12 +1,16 @@
 """
-Marvin Voice Command Backend (SDK version)
-Fix: runner.init() moved into lifespan so uvicorn binds the port FIRST,
-     then loads the model. This is required for Render to detect the open port.
+Marvin Voice Command Backend
+Talks directly to the .eim model via UNIX socket — no edge-impulse-linux SDK needed.
+This avoids the pyaudio / six dependency chain entirely.
 """
  
+import json
 import os
+import socket
+import subprocess
 import tempfile
 import threading
+import time
 import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,45 +19,125 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from edge_impulse_linux.runner import ImpulseRunner  # direct import skips pyaudio in __init__.py
  
 # ─── CONFIG ──────────────────────────────────────
 _default_model = Path(__file__).parent / "model.eim"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", str(_default_model)))
+SOCKET_PATH = "/tmp/marvin_runner.sock"
 SAMPLE_RATE = 16000
-WINDOW_SAMPLES = 16000   # 1 second at 16 kHz
+WINDOW_SAMPLES = 16000          # 1 second at 16 kHz
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6"))
- 
 LABELS = ["Clock", "Forecast", "Greet", "Hello",
           "Noise", "Off", "Stop", "Unknown", "Weather"]
  
-# ─── RUNNER WRAPPER ──────────────────────────────
-# runner is populated inside lifespan (after uvicorn has bound the port)
-runner: ImpulseRunner | None = None
-runner_lock = threading.Lock()
+ 
+# ─── EIM RUNNER ──────────────────────────────────
+class EIMRunner:
+    """
+    Manages the .eim subprocess and communicates via UNIX socket.
+ 
+    Protocol (one connection per inference):
+      1. Client sends  {"id":1, "hello":1}  → server replies with model info
+      2. Client sends  {"id":2, "classify":[...16000 floats...]}
+      3. Server replies with classification result
+    """
+ 
+    def __init__(self, model_path: Path, socket_path: str):
+        self.model_path = model_path
+        self.socket_path = socket_path
+        self.process = None
+        self.lock = threading.Lock()
+        self.ready = False
+ 
+    def start(self):
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model not found: {self.model_path}")
+        self.model_path.chmod(0o755)
+ 
+        if os.path.exists(self.socket_path):
+            os.remove(self.socket_path)
+ 
+        print(f"[EIM] Starting: {self.model_path}")
+        self.process = subprocess.Popen(
+            [str(self.model_path), self.socket_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+ 
+        # Wait up to 15 s for the socket to appear
+        for _ in range(150):
+            if os.path.exists(self.socket_path):
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("EIM model did not create socket in time")
+ 
+        print("[EIM] Ready ✓")
+        self.ready = True
+ 
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.ready = False
+ 
+    def _recv_json(self, sock: socket.socket) -> dict:
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.split(b"\n")[0])
+ 
+    def classify(self, samples: np.ndarray) -> dict:
+        if not self.ready:
+            raise RuntimeError("EIM runner not started")
+ 
+        # Pad / trim to exactly WINDOW_SAMPLES float32 values
+        samples = samples.astype(np.float32)
+        if len(samples) >= WINDOW_SAMPLES:
+            samples = samples[:WINDOW_SAMPLES]
+        else:
+            samples = np.pad(samples, (0, WINDOW_SAMPLES - len(samples)))
+ 
+        with self.lock:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            sock.connect(self.socket_path)
+            try:
+                # Handshake
+                sock.sendall(json.dumps({"id": 1, "hello": 1}).encode() + b"\n")
+                hello = self._recv_json(sock)
+                if not hello.get("success"):
+                    raise RuntimeError(f"EIM hello failed: {hello}")
+ 
+                # Classify
+                sock.sendall(
+                    json.dumps({"id": 2, "classify": samples.tolist()}).encode() + b"\n"
+                )
+                return self._recv_json(sock)
+            finally:
+                sock.close()
  
  
 # ─── APP LIFECYCLE ────────────────────────────────
+eim = EIMRunner(MODEL_PATH, SOCKET_PATH)
+ 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global runner
-    # Ensure model is executable
-    MODEL_PATH.chmod(0o755)
-    print(f"[EIM] Loading model: {MODEL_PATH}")
-    runner = ImpulseRunner(str(MODEL_PATH))
-    runner.init()
-    print("[EIM] Model ready ✓")
+    eim.start()
     yield
-    print("[EIM] Shutting down model...")
-    runner.stop()
-    runner = None
+    eim.stop()
  
  
-# ─── APP ─────────────────────────────────────────
 app = FastAPI(
     title="Marvin Voice Command API",
     description="Edge Impulse voice model inference for ESP32 Marvin device",
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
  
@@ -66,70 +150,49 @@ app.add_middleware(
  
  
 # ─── HELPERS ─────────────────────────────────────
-def _to_window(samples: np.ndarray) -> list:
-    """Pad or trim to exactly WINDOW_SAMPLES floats in [-1, 1]."""
-    samples = samples.astype(np.float32)
-    if len(samples) >= WINDOW_SAMPLES:
-        samples = samples[:WINDOW_SAMPLES]
-    else:
-        samples = np.pad(samples, (0, WINDOW_SAMPLES - len(samples)))
-    return samples.tolist()
- 
- 
 def wav_bytes_to_samples(wav_bytes: bytes) -> np.ndarray:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(wav_bytes)
-        tmp_path = f.name
+        tmp = f.name
     try:
-        with wave.open(tmp_path, "rb") as wf:
-            n_channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
+        with wave.open(tmp, "rb") as wf:
+            n_ch = wf.getnchannels()
+            sw = wf.getsampwidth()
             raw = wf.readframes(wf.getnframes())
-        if sampwidth == 2:
-            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        elif sampwidth == 4:
-            samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        if sw == 2:
+            s = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sw == 4:
+            s = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
         else:
-            raise ValueError(f"Unsupported sample width: {sampwidth}")
-        if n_channels > 1:
-            samples = samples.reshape(-1, n_channels).mean(axis=1)
-        return samples
+            raise ValueError(f"Unsupported sample width: {sw}")
+        if n_ch > 1:
+            s = s.reshape(-1, n_ch).mean(axis=1)
+        return s
     finally:
-        os.unlink(tmp_path)
+        os.unlink(tmp)
  
  
 def raw_pcm_to_samples(data: bytes, bits: int = 16) -> np.ndarray:
     if bits == 16:
         return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-    elif bits == 32:
+    if bits == 32:
         return np.frombuffer(data, dtype=np.int32).astype(np.float32) / 2147483648.0
     raise ValueError(f"Unsupported bit depth: {bits}")
  
  
-def build_response(eim_result: dict, audio_duration_s: float) -> dict:
-    classification = eim_result["result"]["classification"]
-    best_label = max(classification, key=classification.get)
-    best_score = classification[best_label]
-    is_valid = (
-        best_label not in ("Noise", "Unknown")
-        and best_score >= CONFIDENCE_THRESHOLD
-    )
+def build_response(eim_result: dict, duration: float) -> dict:
+    clf = eim_result["result"]["classification"]
+    best = max(clf, key=clf.get)
+    score = clf[best]
+    valid = best not in ("Noise", "Unknown") and score >= CONFIDENCE_THRESHOLD
     return {
-        "command": best_label if is_valid else None,
-        "confidence": round(best_score, 4),
-        "all_scores": {k: round(v, 4) for k, v in classification.items()},
-        "valid": is_valid,
-        "audio_duration_s": round(audio_duration_s, 3),
+        "command": best if valid else None,
+        "confidence": round(score, 4),
+        "all_scores": {k: round(v, 4) for k, v in clf.items()},
+        "valid": valid,
+        "audio_duration_s": round(duration, 3),
         "threshold": CONFIDENCE_THRESHOLD,
     }
- 
- 
-def _run_classify(samples: np.ndarray) -> dict:
-    """Thread-safe classify call."""
-    if runner is None:
-        raise RuntimeError("Model not loaded")
-    with runner_lock:
-        return runner.classify(_to_window(samples))
  
  
 # ─── ROUTES ──────────────────────────────────────
@@ -138,56 +201,43 @@ def root():
     return {
         "service": "Marvin Voice Command API",
         "status": "running",
-        "model": str(MODEL_PATH),
         "labels": LABELS,
         "sample_rate": SAMPLE_RATE,
-        "endpoints": ["/classify/wav", "/classify/raw", "/health"],
+        "endpoints": ["/classify/raw", "/classify/wav", "/health"],
     }
- 
  
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": runner is not None}
- 
+    return {"status": "ok", "model_loaded": eim.ready}
  
 @app.post("/classify/raw")
 async def classify_raw(file: UploadFile = File(...), bits: int = 16):
-    """
-    Preferred endpoint for ESP32.
-    Send raw signed int16 PCM, 16 kHz mono.
-    1 second = 32 000 bytes.
-    """
-    contents = await file.read()
-    if len(contents) < 100:
-        raise HTTPException(400, "Audio data too short")
+    """Preferred ESP32 endpoint. Send raw signed int16 PCM, 16 kHz mono. 1 sec = 32000 bytes."""
+    data = await file.read()
+    if len(data) < 100:
+        raise HTTPException(400, "Audio too short")
     try:
-        samples = raw_pcm_to_samples(contents, bits=bits)
+        samples = raw_pcm_to_samples(data, bits)
     except Exception as e:
-        raise HTTPException(400, f"Failed to decode PCM: {e}")
- 
-    duration = len(samples) / SAMPLE_RATE
+        raise HTTPException(400, f"Bad PCM: {e}")
     try:
-        result = _run_classify(samples)
+        result = eim.classify(samples)
     except Exception as e:
         raise HTTPException(500, f"Inference failed: {e}")
-    return JSONResponse(build_response(result, duration))
- 
+    return JSONResponse(build_response(result, len(samples) / SAMPLE_RATE))
  
 @app.post("/classify/wav")
 async def classify_wav(file: UploadFile = File(...)):
-    """Send a WAV file (16 kHz, mono, 16-bit recommended)."""
-    contents = await file.read()
-    if len(contents) < 44:
-        raise HTTPException(400, "Invalid WAV file")
+    """Send a WAV file (16 kHz mono 16-bit recommended)."""
+    data = await file.read()
+    if len(data) < 44:
+        raise HTTPException(400, "Invalid WAV")
     try:
-        samples = wav_bytes_to_samples(contents)
+        samples = wav_bytes_to_samples(data)
     except Exception as e:
-        raise HTTPException(400, f"Failed to decode WAV: {e}")
- 
-    duration = len(samples) / SAMPLE_RATE
+        raise HTTPException(400, f"Bad WAV: {e}")
     try:
-        result = _run_classify(samples)
+        result = eim.classify(samples)
     except Exception as e:
         raise HTTPException(500, f"Inference failed: {e}")
-    return JSONResponse(build_response(result, duration))
- 
+    return JSONResponse(build_response(result, len(samples) / SAMPLE_RATE))
